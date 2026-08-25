@@ -1,0 +1,17 @@
+__pycache__/
+.pytest_cache/
+.vs/
+.gradio/
+venv/
+history/
+exports/
+CLAUDE.md
+
+*.txt
+!requirements.txt
+!requirements-dev.txt
+!LICENSE.txt
+
+.env
+api_key.py
+.claude/settings.local.json

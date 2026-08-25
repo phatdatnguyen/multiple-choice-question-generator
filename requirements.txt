@@ -1,0 +1,10 @@
+# Lower bounds only, so installs stay current. Each floor marks an API the code
+# actually needs - raise them if you adopt something newer.
+gradio>=6.0          # Textbox(buttons=...) replaced show_copy_button in Gradio 6
+openai>=1.66         # Responses API with structured outputs
+pandas>=2.0
+tiktoken>=0.7        # o200k_base encoding, used as the fallback for new models
+html2text
+pypdf>=4.0
+python-docx>=1.0
+python-pptx>=1.0
