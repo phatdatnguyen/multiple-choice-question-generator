@@ -22,18 +22,16 @@ TOKENS_PER_QUESTION = 220
 class ModelInfo:
     """What we need to know about a model to call it correctly."""
 
-    def __init__(self, context_tokens, *, reasoning=False, needs_tools=False):
+    def __init__(self, context_tokens, *, reasoning=False, needs_tools=False, unsupported_reason=None):
         self.context_tokens = context_tokens
         self.reasoning = reasoning
         self.needs_tools = needs_tools
+        self.unsupported_reason = unsupported_reason
 
 
 # Context windows in tokens. Reasoning models reject temperature/top_p, and the
 # deep-research models require at least one tool to be attached.
 MODEL_REGISTRY = {
-    "gpt-3.5-turbo": ModelInfo(16385),
-    "gpt-4": ModelInfo(8192),
-    "gpt-4-turbo": ModelInfo(128000),
     "gpt-4.1": ModelInfo(1047576),
     "gpt-4.1-mini": ModelInfo(1047576),
     "gpt-4.1-nano": ModelInfo(1047576),
@@ -43,33 +41,51 @@ MODEL_REGISTRY = {
     "gpt-5-mini": ModelInfo(400000, reasoning=True),
     "gpt-5-nano": ModelInfo(400000, reasoning=True),
     "gpt-5-pro": ModelInfo(400000, reasoning=True),
-    "gpt-5-chat-latest": ModelInfo(400000),
+    "gpt-5-chat-latest": ModelInfo(128000),
     "gpt-5.1": ModelInfo(400000, reasoning=True),
-    "gpt-5.1-chat-latest": ModelInfo(400000),
+    "gpt-5.1-chat-latest": ModelInfo(128000),
     "gpt-5.2": ModelInfo(400000, reasoning=True),
     "gpt-5.2-pro": ModelInfo(400000, reasoning=True),
-    "gpt-5.2-chat-latest": ModelInfo(400000),
+    "gpt-5.2-chat-latest": ModelInfo(128000),
     "gpt-5.3-chat-latest": ModelInfo(128000),
     "gpt-5.4": ModelInfo(1050000, reasoning=True),
-    "gpt-5.4-mini": ModelInfo(1050000, reasoning=True),
-    "gpt-5.4-nano": ModelInfo(1050000, reasoning=True),
+    "gpt-5.4-mini": ModelInfo(400000, reasoning=True),
+    "gpt-5.4-nano": ModelInfo(400000, reasoning=True),
     "gpt-5.4-pro": ModelInfo(1050000, reasoning=True),
     "gpt-5.5": ModelInfo(1050000, reasoning=True),
     "gpt-5.5-pro": ModelInfo(1050000, reasoning=True),
     "gpt-5.6-luna": ModelInfo(1050000, reasoning=True),
     "gpt-5.6-terra": ModelInfo(1050000, reasoning=True),
     "gpt-5.6-sol": ModelInfo(1050000, reasoning=True),
+    "gpt-6-astra": ModelInfo(1050000, reasoning=True),
     "o1": ModelInfo(200000, reasoning=True),
     "o1-pro": ModelInfo(200000, reasoning=True),
     "o3": ModelInfo(200000, reasoning=True),
     "o3-mini": ModelInfo(200000, reasoning=True),
     "o3-pro": ModelInfo(200000, reasoning=True),
-    "o3-deep-research": ModelInfo(200000, reasoning=True, needs_tools=True),
     "o4-mini": ModelInfo(200000, reasoning=True),
-    "o4-mini-deep-research": ModelInfo(200000, reasoning=True, needs_tools=True),
 }
 
 MODEL_CHOICES = list(MODEL_REGISTRY)
+
+# These models appear in the account's model list but cannot fulfill our strict
+# JSON-schema request. Keep their metadata for helpful validation of custom IDs.
+# https://developers.openai.com/api/docs/guides/structured-outputs
+# https://developers.openai.com/api/docs/models/o3-deep-research
+# https://developers.openai.com/api/docs/models/o4-mini-deep-research
+_NO_STRUCTURED_OUTPUT = "does not support the strict structured output required for quiz generation"
+UNSUPPORTED_MODEL_REGISTRY = {
+    "gpt-3.5-turbo": ModelInfo(16385, unsupported_reason=_NO_STRUCTURED_OUTPUT),
+    "gpt-4": ModelInfo(8192, unsupported_reason=_NO_STRUCTURED_OUTPUT),
+    "gpt-4-turbo": ModelInfo(128000, unsupported_reason=_NO_STRUCTURED_OUTPUT),
+    "gpt-4o-2024-05-13": ModelInfo(128000, unsupported_reason=_NO_STRUCTURED_OUTPUT),
+    "o3-deep-research": ModelInfo(
+        200000, reasoning=True, needs_tools=True, unsupported_reason=_NO_STRUCTURED_OUTPUT,
+    ),
+    "o4-mini-deep-research": ModelInfo(
+        200000, reasoning=True, needs_tools=True, unsupported_reason=_NO_STRUCTURED_OUTPUT,
+    ),
+}
 
 _FALLBACK_CONTEXT_TOKENS = 128000
 
@@ -85,6 +101,10 @@ def get_model_info(model_name):
     if model_name in MODEL_REGISTRY:
         return MODEL_REGISTRY[model_name]
     name = str(model_name or "").lower()
+    # Longest match keeps gpt-4-turbo's context distinct from the gpt-4 family.
+    for base in sorted(UNSUPPORTED_MODEL_REGISTRY, key=len, reverse=True):
+        if name == base or name.startswith(base + "-"):
+            return UNSUPPORTED_MODEL_REGISTRY[base]
     return ModelInfo(
         _FALLBACK_CONTEXT_TOKENS,
         reasoning="chat" not in name,
@@ -130,7 +150,7 @@ def load_dotenv(path=".env"):
     """
     if not os.path.isfile(path):
         return
-    with open(path, "r", encoding="utf-8") as file:
+    with open(path, "r", encoding="utf-8-sig") as file:
         for line in file:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -144,7 +164,13 @@ def load_dotenv(path=".env"):
 
 def resolve_api_key():
     """Find the API key: environment first, then .env, then api_key.py."""
-    load_dotenv()
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if key:
+        return key
+
+    # Starting the app from a shortcut or another directory must still find the
+    # .env next to webui.py, and a valid environment key needs no file access.
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if key:
         return key
@@ -215,6 +241,7 @@ def fetch_available_models(client, *, keep_prefixes=("gpt-", "o1", "o3", "o4", "
         name for name in names
         if name.startswith(keep_prefixes)
         and not re.search(r"(audio|realtime|transcribe|tts|image|embedding|moderation|search-preview)", name)
+        and not get_model_info(name).unsupported_reason
     ]
     return sorted(set(filtered))
 
@@ -298,12 +325,22 @@ def _request_kwargs(model_name):
     return kwargs
 
 
-def document_token_budget(model_name, count):
-    """How much document text fits in one request for this model."""
+def document_token_budget(model_name, count, *, prompt_tokens=0):
+    """How much document text fits, including the actual instruction length.
+
+    ``prompt_tokens`` is counted by the caller using the document tokenizer.
+    The fixed prompt reserve remains for the schema and message overhead.
+    """
     reserve = PROMPT_TOKEN_RESERVE + max(OUTPUT_TOKEN_RESERVE, count * TOKENS_PER_QUESTION)
     if is_reasoning_model(model_name):
         reserve += OUTPUT_TOKEN_RESERVE  # reasoning tokens also count as output
-    return max(2000, get_max_context_tokens(model_name) - reserve)
+    budget = max(2000, get_max_context_tokens(model_name) - reserve) - prompt_tokens
+    if budget <= 0:
+        raise ValueError(
+            "The instructions leave no room for document text. Shorten the extra "
+            "instructions, request fewer questions, or select a larger-context model."
+        )
+    return budget
 
 
 def split_count(total, parts):
@@ -314,8 +351,40 @@ def split_count(total, parts):
     return [base + (1 if index < remainder else 0) for index in range(parts)]
 
 
+def _response_text(response):
+    """Surface API outcomes that do not contain a completed JSON response."""
+    error = getattr(response, "error", None)
+    if error is not None:
+        raise RuntimeError(f"Generation failed: {error.code}: {error.message}")
+
+    status = getattr(response, "status", None)
+    if status == "incomplete":
+        details = getattr(response, "incomplete_details", None)
+        reason = getattr(details, "reason", None) or "unknown reason"
+        raise RuntimeError(f"Generation was incomplete ({reason}). Try fewer questions per batch.")
+    if status not in (None, "completed"):
+        raise RuntimeError(f"Generation did not complete (status: {status}).")
+
+    # output_text deliberately excludes refusal blocks in the SDK. Without this
+    # check refusals are reported as an unrelated JSON decoding error.
+    for output in getattr(response, "output", ()):
+        if getattr(output, "type", None) == "message":
+            for content in output.content:
+                if getattr(content, "type", None) == "refusal":
+                    raise RuntimeError(f"The model refused this request: {content.refusal}")
+
+    text = response.output_text
+    if not text or not text.strip():
+        raise RuntimeError("The model returned no question data. Try the request again.")
+    return text
+
+
 def generate_questions(client, model_name, prompt, document_text):
-    """Ask the model for questions and return validated ``Question`` objects."""
+    """Ask the model for questions, leaving per-question validation to the caller."""
+    unsupported_reason = get_model_info(model_name).unsupported_reason
+    if unsupported_reason:
+        raise ValueError(f"{model_name} {unsupported_reason}. Choose a different model.")
+
     response = client.responses.create(
         model=model_name,
         instructions=prompt,
@@ -331,10 +400,24 @@ def generate_questions(client, model_name, prompt, document_text):
         **_request_kwargs(model_name),
     )
 
-    payload = json.loads(response.output_text)
+    payload = json.loads(_response_text(response))
+    if not isinstance(payload, dict) or not isinstance(payload.get("questions"), list):
+        raise ValueError("The model response must contain a questions array.")
+
     questions = []
-    for item in payload.get("questions", []):
+    for item in payload["questions"]:
+        # Keep malformed entries available to quiz.validate(), which reports and
+        # skips them without losing good questions from the same batch.
+        if not isinstance(item, dict):
+            questions.append(Question(text=""))
+            continue
+        text = item.get("question", "")
         options = [item.get(f"option_{letter}", "") for letter in ("a", "b", "c", "d")]
-        answer_index = "ABCD".index(item.get("answer", "A"))
-        questions.append(Question(text=item.get("question", ""), options=options, answer_index=answer_index))
+        answer = item.get("answer")
+        answer_index = ("A", "B", "C", "D").index(answer) if answer in ("A", "B", "C", "D") else None
+        questions.append(Question(
+            text=text if isinstance(text, str) else "",
+            options=[option if isinstance(option, str) else "" for option in options],
+            answer_index=answer_index,
+        ))
     return questions

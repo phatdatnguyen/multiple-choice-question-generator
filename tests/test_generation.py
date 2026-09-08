@@ -87,10 +87,11 @@ def test_generate_questions_sends_sampling_params_for_chat_models():
     assert client.responses.calls[0]["temperature"] == 1
 
 
-def test_generate_questions_attaches_a_tool_for_deep_research_models():
+def test_generate_questions_rejects_deep_research_models_before_requesting():
     client = FakeClient([make_payload(1)])
-    llm.generate_questions(client, "o3-deep-research", "prompt", "document")
-    assert client.responses.calls[0]["tools"]
+    with pytest.raises(ValueError, match="does not support the strict structured output"):
+        llm.generate_questions(client, "o3-deep-research", "prompt", "document")
+    assert client.responses.calls == []
 
 
 def test_generate_questions_handles_an_empty_result():
@@ -125,7 +126,7 @@ def test_generate_callback_fills_the_table_and_enables_export(monkeypatch, docum
 
 def test_generate_callback_splits_a_long_document_into_batches(monkeypatch, document):
     """A document over the context limit is chunked instead of erroring."""
-    monkeypatch.setattr(llm, "document_token_budget", lambda model, count: 40)
+    monkeypatch.setattr(llm, "document_token_budget", lambda model, count, **kwargs: 40)
     # One question per reply, with a distinct stem so nothing is deduplicated.
     client = FakeClient([make_payload(1, f"P{i}-") for i in range(40)])
     dataframe, _, notes = run_generate(monkeypatch, client, [document], count=6)
@@ -136,7 +137,7 @@ def test_generate_callback_splits_a_long_document_into_batches(monkeypatch, docu
 
 
 def test_generate_callback_spreads_the_requested_count_over_batches(monkeypatch, document):
-    monkeypatch.setattr(llm, "document_token_budget", lambda model, count: 40)
+    monkeypatch.setattr(llm, "document_token_budget", lambda model, count, **kwargs: 40)
     client = FakeClient([make_payload(1)] * 20)
     run_generate(monkeypatch, client, [document], count=7)
     counts = [
@@ -147,7 +148,7 @@ def test_generate_callback_spreads_the_requested_count_over_batches(monkeypatch,
 
 
 def test_generate_callback_survives_one_failed_batch(monkeypatch, document):
-    monkeypatch.setattr(llm, "document_token_budget", lambda model, count: 40)
+    monkeypatch.setattr(llm, "document_token_budget", lambda model, count, **kwargs: 40)
     replies = [make_payload(2), RuntimeError("rate limited"), make_payload(2)]
     client = FakeClient(replies + [make_payload(2)] * 20)
     dataframe, export_update, notes = run_generate(monkeypatch, client, [document], count=6)

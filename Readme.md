@@ -56,9 +56,10 @@ Then open http://127.0.0.1:7860 in a browser.
 
 ### Using it
 
-1. Pick a model. The dropdown lists known models; press **↻** to replace the
-   list with the models your account can actually use, or type a model ID
-   directly.
+1. Pick a model. The dropdown lists known models; press **↻** to refresh it
+   from your account, or type a model ID directly. Known models that cannot
+   produce the required structured output are excluded. Newly listed models
+   may still have incompatible capabilities or account restrictions.
 2. Choose how many questions you want and which language to write them in.
 3. Optionally add extra instructions ("focus on chapter 3", "avoid definition
    questions"). The full prompt is visible under **Prompt preview**.
@@ -66,13 +67,18 @@ Then open http://127.0.0.1:7860 in a browser.
 5. Edit anything you want in the table - it is fully editable.
 6. Optionally shuffle or sample under **Shuffle and sample**.
 7. Pick an export format, then press **Export questions**. The file is written
-   to `exports/` and offered as a download.
+   to a separate folder under `exports/` and offered as a download. Reusing a
+   filename keeps earlier exports intact. Editing the table clears the previous
+   download so you can export the updated questions.
 
 Notes and warnings (unreadable files, failed batches, questions that look like
 duplicates) appear below the table.
 
 Documents longer than the model's context window are split automatically and the
 requested question count is spread across the batches.
+If there are more batches than requested questions, the notes identify the
+unused batches. Increase the question count, select a model with a larger
+context window, or upload smaller documents to cover all the text.
 
 ## Troubleshooting
 

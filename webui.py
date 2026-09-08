@@ -61,7 +61,7 @@ def on_refresh_models(current_model):
     try:
         names = llm.fetch_available_models(get_client())
     except Exception as exc:
-        gr.Warning(f"Could not list models: {exc}")
+        gr.Warning(f"Could not list models: {llm.describe_error(exc)}")
         return gr.update()
     if not names:
         gr.Warning("The API returned no usable chat models.")
@@ -80,57 +80,71 @@ def on_generate_questions(
     progress=gr.Progress(),
 ):
     """Extract the documents, then generate questions in as many batches as needed."""
-    failure = (empty_dataframe(), gr.update(interactive=False), "")
+    notes = []
+
+    def fail(message):
+        gr.Warning(message)
+        notes.append(message)
+        return empty_dataframe(), gr.update(interactive=False), _format_notes(notes)
 
     if not document_files:
-        gr.Warning("Please upload at least one document first.")
-        return failure
+        return fail("Please upload at least one document first.")
 
-    requested = int(number_of_questions)
-    notes = []
+    try:
+        requested = int(number_of_questions)
+        if requested != float(number_of_questions) or not 1 <= requested <= 100:
+            raise ValueError("Choose a whole number from 1 to 100.")
+    except (TypeError, ValueError, OverflowError):
+        return fail("Number of questions must be a whole number from 1 to 100.")
+    if not isinstance(llm_model, str) or not llm_model.strip():
+        return fail("Please select a model first.")
+    llm_model = llm_model.strip()
 
     progress(0.0, desc="Reading documents...")
     try:
         document_text, read_problems = documents.build_document_context(document_files)
     except Exception as exc:
-        gr.Warning(f"Could not read the documents: {exc}")
-        return failure
+        return fail(f"Could not read the documents: {llm.describe_error(exc)}")
 
     notes.extend(read_problems)
     if not document_text:
-        gr.Warning("None of the uploaded files could be read.")
-        return (empty_dataframe(), gr.update(interactive=False), _format_notes(notes))
+        return fail("None of the uploaded files could be read.")
 
     # Split the document if it will not fit in one request, and spread the
     # requested question count over the batches.
-    budget = llm.document_token_budget(llm_model, requested)
     try:
+        prompt = llm.build_prompt(language, requested, extra_instructions)
+        budget = llm.document_token_budget(
+            llm_model, requested, prompt_tokens=documents.count_tokens(prompt, llm_model),
+        )
         chunks = documents.chunk_text(document_text, budget, llm_model)
     except Exception as exc:
-        gr.Warning(f"Could not prepare the document: {exc}")
-        return failure
+        return fail(f"Could not prepare the document: {llm.describe_error(exc)}")
 
     if not chunks:
-        gr.Warning("The documents contained no usable text.")
-        return failure
+        return fail("The documents contained no usable text.")
 
     if len(chunks) > 1:
         notes.append(
-            f"Document exceeds the {llm.get_max_context_tokens(llm_model):,}-token context of "
+            f"Document exceeds the available {budget:,}-token input budget for "
             f"{llm_model}; split into {len(chunks)} batches."
         )
 
     per_chunk = llm.split_count(requested, len(chunks))
+    if len(chunks) > requested:
+        notes.append(
+            f"Only the first {requested} of {len(chunks)} document batches will be used. "
+            f"Request at least {len(chunks)} questions, use a model with a larger context, "
+            "or upload smaller documents to cover all the text."
+        )
     collected = []
 
     try:
         client = get_client()
     except llm.MissingAPIKey as exc:
-        gr.Warning(str(exc))
-        return failure
+        return fail(llm.describe_error(exc))
     except Exception as exc:
-        gr.Warning(f"Could not create the API client: {llm.describe_error(exc)}")
-        return failure
+        return fail(f"Could not create the API client: {llm.describe_error(exc)}")
 
     for index, (chunk, count) in enumerate(zip(chunks, per_chunk)):
         if count <= 0:
@@ -148,8 +162,7 @@ def on_generate_questions(
     progress(1.0, desc="Checking results...")
 
     if not collected:
-        gr.Warning("No questions were generated. See the notes below the table.")
-        return (empty_dataframe(), gr.update(interactive=False), _format_notes(notes))
+        return fail("No questions were generated. Try again or choose a different model.")
 
     questions, validation_problems = quiz.validate(collected)
     notes.extend(validation_problems)
@@ -161,8 +174,7 @@ def on_generate_questions(
         )
 
     if not questions:
-        gr.Warning("Every generated question failed validation.")
-        return (empty_dataframe(), gr.update(interactive=False), _format_notes(notes))
+        return fail("Every generated question failed validation.")
 
     if len(questions) != requested:
         notes.append(f"Model returned {len(questions)} valid questions, {requested} were requested.")
@@ -194,12 +206,19 @@ def on_shuffle(question_dataframe, shuffle_order, shuffle_answers, sample_enable
             sample=int(sample_size) if sample_enabled else None,
             rng=random,
         )
-    except ValueError as exc:
-        gr.Warning(str(exc))
+    except (TypeError, ValueError, OverflowError) as exc:
+        problems.append(f"Could not shuffle the questions: {llm.describe_error(exc)}")
+        gr.Warning(problems[-1])
         return question_dataframe, _format_notes(problems)
 
     gr.Info(f"{len(result)} questions ready.")
     return questions_to_dataframe(result), _format_notes(problems)
+
+
+def on_table_change(question_dataframe):
+    """Enable export for valid edits and invalidate downloads of earlier rows."""
+    questions, _ = dataframe_to_questions(question_dataframe)
+    return gr.update(interactive=bool(questions)), "", gr.update(value=None, visible=False)
 
 
 def on_export_questions(question_dataframe, file_name, export_format):
@@ -220,15 +239,25 @@ def on_export_questions(question_dataframe, file_name, export_format):
     stem = quiz.safe_file_stem(file_name)
     try:
         os.makedirs(EXPORT_DIR, exist_ok=True)
-        target = os.path.join(EXPORT_DIR, stem + suffix)
+        # Each download keeps its own snapshot even if another export uses the
+        # same name before Gradio has copied the file into its download cache.
+        directory = tempfile.mkdtemp(prefix="mcq-", dir=EXPORT_DIR)
+        target = os.path.join(directory, stem + suffix)
         with open(target, "w", encoding="utf-8", newline="\n") as file:
             file.write(text)
     except OSError as exc:
         # Still let the user download even if the local copy cannot be written.
-        target = os.path.join(tempfile.mkdtemp(prefix="mcq-"), stem + suffix)
-        with open(target, "w", encoding="utf-8", newline="\n") as file:
-            file.write(text)
-        problems.append(f"Could not write to the exports folder ({exc}); using a temporary file.")
+        problems.append(
+            f"Could not write to the exports folder ({llm.describe_error(exc)}); "
+            "using a temporary file."
+        )
+        try:
+            target = os.path.join(tempfile.mkdtemp(prefix="mcq-"), stem + suffix)
+            with open(target, "w", encoding="utf-8", newline="\n") as file:
+                file.write(text)
+        except OSError as fallback_exc:
+            problems.append(f"Could not create the download: {llm.describe_error(fallback_exc)}")
+            return _format_notes(problems, prefix="❌"), hidden
 
     status = [f"✅ Exported {len(questions)} questions to `{target}`."]
     status.extend(f"⚠️ {problem}" for problem in problems)
@@ -325,6 +354,12 @@ with gr.Blocks(title="Multiple-choice question generator") as demo:
         on_shuffle,
         [question_dataframe, shuffle_order, shuffle_answers, sample_enabled, sample_size],
         [question_dataframe, notes_output],
+    )
+
+    question_dataframe.change(
+        on_table_change,
+        question_dataframe,
+        [export_button, export_status, export_file],
     )
 
     export_button.click(

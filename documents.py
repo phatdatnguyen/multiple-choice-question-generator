@@ -53,12 +53,17 @@ def read_pdf_file(file_path):
 
 def read_word_file(file_path):
     document = Document(file_path)
-    parts = [paragraph.text for paragraph in document.paragraphs]
+    # Keep tables next to the paragraphs that explain them. Reading all
+    # paragraphs first would move every table to the end of the document.
+    content = {paragraph._element: [paragraph.text] for paragraph in document.paragraphs}
     for table in document.tables:
+        rows = []
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells]
             if any(cells):
-                parts.append(" | ".join(cells))
+                rows.append(" | ".join(cells))
+        content[table._element] = rows
+    parts = [part for element in document.element.body for part in content.get(element, [])]
     return "\n".join(parts)
 
 
@@ -66,16 +71,28 @@ def read_powerpoint_file(file_path):
     presentation = Presentation(file_path)
     parts = []
     for number, slide in enumerate(presentation.slides, start=1):
-        parts.append(f"--- Slide {number} ---")
-        for shape in slide.shapes:
-            if shape.has_text_frame and shape.text_frame.text.strip():
-                parts.append(shape.text_frame.text)
-            elif getattr(shape, "has_table", False):
-                for row in shape.table.rows:
-                    parts.append(" | ".join(cell.text.strip() for cell in row.cells))
-        if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
-            parts.append(f"[Notes] {slide.notes_slide.notes_text_frame.text}")
+        slide_parts = list(_powerpoint_shape_text(slide.shapes))
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame
+            if notes is not None and notes.text.strip():
+                slide_parts.append(f"[Notes] {notes.text}")
+        if slide_parts:
+            parts.append(f"--- Slide {number} ---")
+            parts.extend(slide_parts)
     return "\n".join(parts)
+
+
+def _powerpoint_shape_text(shapes):
+    for shape in shapes:
+        if shape.has_text_frame and shape.text_frame.text.strip():
+            yield shape.text_frame.text
+        elif getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    yield " | ".join(cells)
+        elif hasattr(shape, "shapes"):
+            yield from _powerpoint_shape_text(shape.shapes)
 
 
 def _html_to_text(markup):
@@ -222,12 +239,17 @@ def build_document_context(file_paths, *, use_cache=True):
     Returns ``(text, problems)``; unreadable files are reported but do not stop
     the readable ones from being used.
     """
-    if isinstance(file_paths, (str, bytes)) or file_paths is None:
+    if isinstance(file_paths, (str, bytes, os.PathLike)) or file_paths is None:
         file_paths = [file_paths] if file_paths else []
 
     sections, problems = [], []
     for file_path in file_paths:
-        path = getattr(file_path, "name", file_path)
+        # pathlib.Path.name is only the basename, while uploaded file objects
+        # expose their full temporary path through .name.
+        path = (
+            file_path if isinstance(file_path, (str, bytes, os.PathLike))
+            else getattr(file_path, "name", file_path)
+        )
         try:
             text = extract_text(path, use_cache=use_cache)
         except DocumentError as exc:
@@ -259,7 +281,7 @@ def get_encoding(model):
 
 def count_tokens(text, model):
     """Count tokens in a string."""
-    return len(get_encoding(model).encode(str(text or "")))
+    return len(get_encoding(model).encode(str(text or ""), disallowed_special=()))
 
 
 def chunk_text(text, max_tokens, model):
@@ -273,21 +295,26 @@ def chunk_text(text, max_tokens, model):
 
     encoding = get_encoding(model)
     text = str(text or "")
-    if len(encoding.encode(text)) <= max_tokens:
+    if len(encoding.encode(text, disallowed_special=())) <= max_tokens:
         return [text] if text.strip() else []
 
     chunks, current, current_tokens = [], [], 0
+    separator_tokens = len(encoding.encode("\n\n", disallowed_special=()))
 
     def flush():
         nonlocal current, current_tokens
         if current:
-            chunks.append("\n\n".join(current).strip())
+            # Re-tokenize the actual result: joining/stripping can change token
+            # boundaries, so the sum of the individual counts is only an estimate.
+            chunks.extend(_split_token_blocks("\n\n".join(current).strip(), max_tokens, encoding))
             current, current_tokens = [], 0
 
     for block in _split_blocks(text, max_tokens, encoding):
-        block_tokens = len(encoding.encode(block))
-        if current_tokens + block_tokens > max_tokens:
+        block_tokens = len(encoding.encode(block, disallowed_special=()))
+        if current and current_tokens + separator_tokens + block_tokens > max_tokens:
             flush()
+        if current:
+            current_tokens += separator_tokens
         current.append(block)
         current_tokens += block_tokens
     flush()
@@ -297,17 +324,35 @@ def chunk_text(text, max_tokens, model):
 def _split_blocks(text, max_tokens, encoding):
     """Yield blocks that each fit within ``max_tokens``."""
     for paragraph in re.split(r"\n\s*\n", text):
-        if not paragraph.strip():
+        paragraph = paragraph.strip()
+        if not paragraph:
             continue
-        if len(encoding.encode(paragraph)) <= max_tokens:
+        if len(encoding.encode(paragraph, disallowed_special=())) <= max_tokens:
             yield paragraph
             continue
         for line in paragraph.splitlines():
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
-            tokens = encoding.encode(line)
-            if len(tokens) <= max_tokens:
-                yield line
-            else:
-                for start in range(0, len(tokens), max_tokens):
-                    yield encoding.decode(tokens[start:start + max_tokens])
+            yield from _split_token_blocks(line, max_tokens, encoding)
+
+
+def _split_token_blocks(text, max_tokens, encoding):
+    """Split at token boundaries that also preserve complete UTF-8 characters."""
+    tokens = encoding.encode(text, disallowed_special=())
+    start = 0
+    while start < len(tokens):
+        end = min(start + max_tokens, len(tokens))
+        while end > start:
+            try:
+                block = encoding.decode(tokens[start:end], errors="strict")
+            except UnicodeDecodeError:
+                end -= 1
+                continue
+            if len(encoding.encode(block, disallowed_special=())) <= max_tokens:
+                break
+            end -= 1
+        if end == start:
+            raise ValueError("max_tokens is too small to contain a complete Unicode character.")
+        yield block
+        start = end

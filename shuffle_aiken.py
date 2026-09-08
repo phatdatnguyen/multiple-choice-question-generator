@@ -59,11 +59,13 @@ def main(argv=None):
     try:
         with open(args.input, "r", encoding="utf-8-sig") as file:
             text = file.read()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         print(f"Error: cannot read {args.input}: {exc}", file=sys.stderr)
         return 1
 
     questions, problems = quiz.parse_aiken(text, require_answers=require_answers)
+    questions, validation_problems = quiz.validate(questions, require_answers=require_answers)
+    problems.extend(validation_problems)
     for problem in problems:
         print(f"Warning: {problem}", file=sys.stderr)
 

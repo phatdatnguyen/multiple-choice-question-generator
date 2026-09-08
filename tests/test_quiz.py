@@ -76,6 +76,21 @@ def test_parse_aiken_reports_question_missing_answer():
     assert "no ANSWER line" in problems[0]
 
 
+def test_parse_aiken_recovers_after_question_missing_answer():
+    text = "Broken?\nA. one\nB. two\n\nGood?\nA. three\nB. four\nANSWER: B"
+    questions, problems = quiz.parse_aiken(text)
+    assert len(problems) == 1
+    assert "no ANSWER line" in problems[0]
+    assert questions == [quiz.Question("Good?", ["three", "four"], 1)]
+
+
+def test_parse_aiken_allows_blank_lines_before_options_and_answer():
+    text = "Q?\nA. one\n\nB. two\n\nANSWER: B"
+    questions, problems = quiz.parse_aiken(text)
+    assert problems == []
+    assert questions == [quiz.Question("Q?", ["one", "two"], 1)]
+
+
 def test_parse_aiken_reports_unrecognised_answer():
     questions, problems = quiz.parse_aiken("Q?\nA. one\nB. two\nANSWER: Z")
     assert questions == []
@@ -149,6 +164,14 @@ def test_shuffle_options_without_answer_stays_answerless():
 def test_shuffle_quiz_samples_requested_count():
     questions = [quiz.Question(f"Q{i}", ["a", "b"], 0) for i in range(10)]
     assert len(quiz.shuffle_quiz(questions, sample=4, rng=random.Random(1))) == 4
+
+
+def test_shuffle_quiz_sampling_preserves_order_when_shuffle_order_is_false():
+    questions = [quiz.Question(f"Q{i}", ["a", "b"], 0) for i in range(10)]
+    sampled = quiz.shuffle_quiz(questions, sample=5, shuffle_order=False, rng=random.Random(1))
+    positions = [questions.index(question) for question in sampled]
+    assert len(positions) == 5
+    assert positions == sorted(positions)
 
 
 def test_shuffle_quiz_rejects_oversized_sample():
@@ -247,6 +270,19 @@ def test_to_moodle_xml_survives_cdata_terminator_in_text():
     assert "]]>" in root.findtext("./question/questiontext/text")
 
 
+def test_to_moodle_xml_preserves_literal_html_syntax():
+    from xml.etree import ElementTree
+
+    question = quiz.Question("What does <br> mean?", ["A <b> tag", "A line break"], 1)
+    root = ElementTree.fromstring(quiz.to_moodle_xml([question]))
+    questiontext = root.find("./question/questiontext")
+    assert questiontext.get("format") == "plain_text"
+    assert questiontext.findtext("text") == question.text
+    answers = root.findall("./question/answer")
+    assert all(answer.get("format") == "plain_text" for answer in answers)
+    assert answers[0].findtext("text") == question.options[0]
+
+
 def test_to_csv_has_header_and_answer_letter():
     output = quiz.to_csv([quiz.Question("Q?", ["a", "b", "c", "d"], 2)])
     header, row = output.splitlines()[:2]
@@ -285,6 +321,15 @@ def test_safe_file_stem_caps_length():
     assert len(quiz.safe_file_stem("x" * 500)) == 100
 
 
+@pytest.mark.parametrize("raw", ["CON", "nul", "Aux.txt", "COM1", "lpt9.quiz", "CON .quiz"])
+def test_safe_file_stem_avoids_windows_device_names(raw):
+    assert quiz.safe_file_stem(raw) == "_" + raw
+
+
+def test_safe_file_stem_strips_trailing_spaces_after_truncation():
+    assert quiz.safe_file_stem("x" * 99 + " more") == "x" * 99
+
+
 # --------------------------------------------------------------------------- #
 # Dataframe round trip
 # --------------------------------------------------------------------------- #
@@ -307,5 +352,44 @@ def test_from_rows_handles_none_and_short_rows():
     assert questions[0].answer_index == 0
 
 
+@pytest.mark.parametrize("answer", ["C", "Option C", "3", "correct"])
+def test_from_rows_keeps_answer_when_an_earlier_option_is_blank(answer):
+    questions, _ = quiz.from_rows([["Q", "first", "", "correct", "last", answer]])
+    assert questions == [quiz.Question("Q", ["first", "correct", "last"], 1)]
+
+
+def test_from_rows_rejects_answer_pointing_to_a_cleared_option():
+    questions, problems = quiz.from_rows([["Q", "first", " ", "third", "last", "B"]])
+    assert questions == []
+    assert "no correct answer" in problems[0]
+
+
 def test_to_rows_pads_to_four_options():
     assert quiz.to_rows([quiz.Question("Q", ["a", "b"], 0)]) == [["Q", "a", "b", "", "", "A"]]
+
+
+# --------------------------------------------------------------------------- #
+# CLI validation
+# --------------------------------------------------------------------------- #
+
+def test_cli_skips_invalid_questions_before_export(tmp_path, capsys):
+    import shuffle_aiken
+
+    source = tmp_path / "input.txt"
+    target = tmp_path / "output.txt"
+    source.write_text("Invalid?\nA. one\nANSWER: A\n\n" + AIKEN_SAMPLE, encoding="utf-8")
+    assert shuffle_aiken.main([str(source), str(target), "--no-shuffle-questions"]) == 0
+    exported, _ = quiz.parse_aiken(target.read_text(encoding="utf-8"))
+    assert len(exported) == 2
+    assert "needs at least 2 non-empty options" in capsys.readouterr().err
+
+
+def test_cli_reports_invalid_utf8_without_a_traceback(tmp_path, capsys):
+    import shuffle_aiken
+
+    source = tmp_path / "input.txt"
+    target = tmp_path / "output.txt"
+    source.write_bytes(b"\xff\xfeinvalid")
+    assert shuffle_aiken.main([str(source), str(target)]) == 1
+    assert "cannot read" in capsys.readouterr().err
+    assert not target.exists()

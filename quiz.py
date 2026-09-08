@@ -23,6 +23,9 @@ EXPORT_FORMATS = ["Aiken (.txt)", "GIFT (.txt)", "Moodle XML (.xml)", "CSV (.csv
 _LABEL_RE = re.compile(r"^([A-Za-z])\s*[.):]\s*(.*)$")
 _ANSWER_RE = re.compile(r"^(?:ANSWER|ANS|ĐÁP\s*ÁN|DAP\s*AN)\s*[:.]?\s*(.*)$", re.IGNORECASE)
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9 ._-]+")
+_WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+}
 
 
 @dataclass
@@ -183,7 +186,10 @@ def shuffle_quiz(questions, *, shuffle_order=True, shuffle_answers=False, sample
             raise ValueError("Number of questions to keep must be greater than 0.")
         if sample > len(result):
             raise ValueError(f"Cannot keep {sample} questions - only {len(result)} available.")
-        result = rng.sample(result, sample)
+        indices = rng.sample(range(len(result)), sample)
+        if not shuffle_order:
+            indices.sort()
+        result = [result[index] for index in indices]
     if shuffle_order:
         rng.shuffle(result)
     if shuffle_answers:
@@ -208,6 +214,7 @@ def parse_aiken(text, *, require_answers=True):
     stem_lines, options, answer_raw = [], [], None
     started_line = 0
     line_number = 0
+    after_blank = False
 
     def flush(line_number, *, complete):
         nonlocal stem_lines, options, answer_raw
@@ -237,7 +244,19 @@ def parse_aiken(text, *, require_answers=True):
             # In answerless files a blank line is the only question separator.
             if not require_answers:
                 flush(line_number, complete=True)
+            elif options:
+                after_blank = True
             continue
+
+        if after_blank:
+            expected = OPTION_LABELS[len(options)] if len(options) < len(OPTION_LABELS) else None
+            label_match = _LABEL_RE.match(line)
+            continues_options = label_match and label_match.group(1).upper() == expected
+            if not _ANSWER_RE.match(line) and not continues_options:
+                # Recover at the next question instead of absorbing its stem
+                # and options into a question whose ANSWER line is missing.
+                flush(line_number, complete=False)
+            after_blank = False
 
         if not stem_lines and not options:
             started_line = line_number
@@ -315,7 +334,7 @@ def to_moodle_xml(questions, *, category=None):
         out += [
             '  <question type="multichoice">',
             f"    <name><text>Question {position}</text></name>",
-            f'    <questiontext format="html"><text>{_cdata(question.text)}</text></questiontext>',
+            f'    <questiontext format="plain_text"><text>{_cdata(question.text)}</text></questiontext>',
             "    <single>true</single>",
             "    <shuffleanswers>true</shuffleanswers>",
             "    <answernumbering>abc</answernumbering>",
@@ -323,7 +342,7 @@ def to_moodle_xml(questions, *, category=None):
         for index, option in enumerate(question.options):
             fraction = 100 if index == question.answer_index else 0
             out += [
-                f'    <answer fraction="{fraction}" format="html">',
+                f'    <answer fraction="{fraction}" format="plain_text">',
                 f"      <text>{_cdata(option)}</text>",
                 "    </answer>",
             ]
@@ -375,7 +394,10 @@ def safe_file_stem(name, *, default="questions"):
     Prevents a value such as ``../../notes`` from escaping the output folder.
     """
     candidate = _FILENAME_RE.sub("_", str(name or "").replace("\\", "/").split("/")[-1]).strip(" .")
-    return candidate[:100] or default
+    # Windows reserves these names even when an extension is appended.
+    if candidate.split(".", 1)[0].rstrip().upper() in _WINDOWS_RESERVED_NAMES:
+        candidate = "_" + candidate
+    return candidate[:100].rstrip(" .") or default
 
 
 # --------------------------------------------------------------------------- #
@@ -401,6 +423,11 @@ def from_rows(rows, *, require_answers=True):
         values = ["" if value is None else str(value) for value in row]
         values += [""] * max(0, 6 - len(values))
         stem, option_values, answer_raw = values[0], values[1:5], values[5]
-        options = [option for option in option_values if option.strip()]
-        parsed.append(Question(text=stem, options=options, answer_index=parse_answer(answer_raw, options)))
+        # Resolve labels against their original columns before removing blanks.
+        # Otherwise clearing B silently makes answer C refer to the old D.
+        original_answer = parse_answer(answer_raw, option_values)
+        kept_indices = [index for index, option in enumerate(option_values) if option.strip()]
+        options = [option_values[index] for index in kept_indices]
+        answer_index = kept_indices.index(original_answer) if original_answer in kept_indices else None
+        parsed.append(Question(text=stem, options=options, answer_index=answer_index))
     return validate(parsed, require_answers=require_answers)
